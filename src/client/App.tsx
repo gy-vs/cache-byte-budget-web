@@ -1,4 +1,4 @@
-import {useEffect, useState} from 'react';
+import {useEffect, useRef, useState} from 'react';
 import {Database, FlaskConical, Play, RotateCw, Save} from 'lucide-react';
 
 type Summary = {id: string; name: string; revision: number; vary: string; updatedAt: string};
@@ -17,23 +17,36 @@ type CanonicalKey = {
   canonical: string;
   bypass: boolean;
 };
+type EvictedInfo = {canonical: string; resource: string; revision: number; bytes: number};
 type CacheInfo = {
   status: string;
   reason: string;
   key: CanonicalKey | null;
   invalidated?: string;
+  stored?: boolean;
+  notStoredReason?: string;
+  evicted?: EvictedInfo[];
+};
+type CacheVariant = {canonical: string; revision: number; bytes: number; storedAt: number};
+type CacheState = {
+  budgetBytes: number | null;
+  usedBytes: number;
+  entryCount: number;
+  resources: Array<{resource: string; bytes: number; variants: CacheVariant[]}>;
 };
 
-function decodeKey(value: string | null): CanonicalKey | null {
+function decodeHeader<T>(value: string | null): T | null {
   if (!value) return null;
   try {
     const binary = atob(value);
     const bytes = Uint8Array.from(binary, (ch) => ch.charCodeAt(0));
-    return JSON.parse(new TextDecoder().decode(bytes)) as CanonicalKey;
+    return JSON.parse(new TextDecoder().decode(bytes)) as T;
   } catch {
     return null;
   }
 }
+
+const decodeKey = (value: string | null) => decodeHeader<CanonicalKey>(value);
 
 export default function App() {
   const [items, setItems] = useState<Summary[]>([]);
@@ -47,10 +60,25 @@ export default function App() {
   const [xLocale, setXLocale] = useState('en-US');
   const [acceptLanguage, setAcceptLanguage] = useState('en, fr;q=0.9');
   const [cacheInfo, setCacheInfo] = useState<CacheInfo | null>(null);
+  // Shared server-side cache state (single cache for all resources).
+  const [cacheState, setCacheState] = useState<CacheState | null>(null);
+  const [budgetDraft, setBudgetDraft] = useState('');
+  const [budgetNote, setBudgetNote] = useState<string | null>(null);
+  const budgetInitialized = useRef(false);
 
   useEffect(() => {
     fetch('/api/experiments').then((r) => r.json()).then(setItems);
   }, []);
+
+  async function refreshCache() {
+    const response = await fetch('/api/cache');
+    const state = (await response.json()) as CacheState;
+    setCacheState(state);
+    if (!budgetInitialized.current) {
+      budgetInitialized.current = true;
+      setBudgetDraft(state.budgetBytes === null ? '' : String(state.budgetBytes));
+    }
+  }
 
   async function load(id: string, opts?: {replay?: boolean}) {
     const headers: Record<string, string> = {};
@@ -64,12 +92,17 @@ export default function App() {
     setRow(value);
     setDraft(value.content);
     setVaryDraft(value.vary);
+    const storedHeader = response.headers.get('X-Cache-Stored');
     setCacheInfo({
       status: response.headers.get('X-Cache-Status') ?? '—',
       reason: response.headers.get('X-Cache-Reason') ?? '—',
       key: decodeKey(response.headers.get('X-Cache-Key')),
+      stored: storedHeader === null ? undefined : storedHeader === 'true',
+      notStoredReason: response.headers.get('X-Cache-Not-Stored-Reason') ?? undefined,
+      evicted: decodeHeader<EvictedInfo[]>(response.headers.get('X-Cache-Evictions')) ?? [],
     });
     setStatus('Loaded');
+    await refreshCache();
   }
 
   useEffect(() => {
@@ -102,6 +135,38 @@ export default function App() {
     );
   }
 
+  async function applyBudget() {
+    const trimmed = budgetDraft.trim();
+    let budgetBytes: number | null = null;
+    if (trimmed !== '') {
+      const parsed = Number(trimmed);
+      if (!Number.isInteger(parsed) || parsed < 0) {
+        setBudgetNote('Enter a non-negative integer, or leave blank for unbounded.');
+        return;
+      }
+      budgetBytes = parsed;
+    }
+    setStatus('Applying budget');
+    const response = await fetch('/api/cache/budget', {
+      method: 'PUT',
+      headers: {'content-type': 'application/json'},
+      body: JSON.stringify({budgetBytes}),
+    });
+    const value = await response.json();
+    if (!response.ok) {
+      setBudgetNote('Budget rejected by the server.');
+    } else {
+      const label = value.budgetBytes === null ? 'unbounded' : `${value.budgetBytes} B`;
+      setBudgetNote(
+        value.evicted.length > 0
+          ? `Budget ${label}: ${value.evicted.length} variant(s) no longer retained (freed ${value.evictedBytes} B).`
+          : `Budget ${label}: all existing variants retained.`,
+      );
+    }
+    await refreshCache();
+    setStatus('Ready');
+  }
+
   async function analyze() {
     if (!row) return;
     setStatus('Analyzing');
@@ -119,7 +184,7 @@ export default function App() {
       <header className="topbar">
         <FlaskConical size={20} />
         <strong>HTTP Cache Lab</strong>
-        <small>Vary canonical keys</small>
+        <small>Vary canonical keys · bounded capacity</small>
       </header>
       <section className="workspace">
         <aside className="pane">
@@ -200,6 +265,75 @@ export default function App() {
           <h2>
             <Database size={15} /> Cache inspection
           </h2>
+
+          <div className="capacity">
+            <h3>Capacity — one shared server cache</h3>
+            {cacheState ? (
+              <>
+                <div className="usageline">
+                  {cacheState.usedBytes} / {cacheState.budgetBytes ?? '∞'} bytes ·{' '}
+                  {cacheState.entryCount} variant(s)
+                </div>
+                <div className="meter">
+                  <div
+                    style={{
+                      width: cacheState.budgetBytes
+                        ? `${Math.min(100, (cacheState.usedBytes / cacheState.budgetBytes) * 100)}%`
+                        : '0%',
+                    }}
+                  />
+                </div>
+                <label>
+                  Entity budget in bytes (blank = unbounded)
+                  <input
+                    value={budgetDraft}
+                    onChange={(event) => setBudgetDraft(event.target.value)}
+                    placeholder="e.g. 600"
+                    spellCheck={false}
+                  />
+                </label>
+                <button onClick={applyBudget}>Apply budget</button>
+                {budgetNote && <p className="hint">{budgetNote}</p>}
+                {cacheState.resources.length === 0 ? (
+                  <p className="hint">Cache is empty.</p>
+                ) : (
+                  cacheState.resources.map((group) => (
+                    <div key={group.resource}>
+                      <p className="resource">
+                        {group.resource} — {group.bytes} B · {group.variants.length} variant(s)
+                      </p>
+                      <table>
+                        <thead>
+                          <tr>
+                            <th>bytes</th>
+                            <th>rev</th>
+                            <th>variant key (LRU → MRU)</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {group.variants.map((variant) => (
+                            <tr key={variant.canonical}>
+                              <td>{variant.bytes}</td>
+                              <td>{variant.revision}</td>
+                              <td>
+                                <details>
+                                  <summary>canonical</summary>
+                                  <code>{variant.canonical}</code>
+                                </details>
+                              </td>
+                            </tr>
+                          ))}
+                        </tbody>
+                      </table>
+                    </div>
+                  ))
+                )}
+              </>
+            ) : (
+              <p>Loading cache state…</p>
+            )}
+          </div>
+
           {cacheInfo ? (
             <>
               <div className="badges">
@@ -207,10 +341,43 @@ export default function App() {
                   {cacheInfo.status}
                 </span>
                 <span className="pill reason">{cacheInfo.reason}</span>
+                {cacheInfo.stored === true && <span className="pill status-hit">retained</span>}
+                {cacheInfo.stored === false && (
+                  <span className="pill status-bypass">
+                    not retained{cacheInfo.notStoredReason ? ` · ${cacheInfo.notStoredReason}` : ''}
+                  </span>
+                )}
+                {cacheInfo.evicted && cacheInfo.evicted.length > 0 && (
+                  <span className="pill">evicted {cacheInfo.evicted.length}</span>
+                )}
                 {cacheInfo.invalidated !== undefined && (
                   <span className="pill">invalidated {cacheInfo.invalidated}</span>
                 )}
               </div>
+
+              {cacheInfo.evicted && cacheInfo.evicted.length > 0 && (
+                <div className="keycard">
+                  <h3>Evicted to make room for this fill</h3>
+                  <table>
+                    <thead>
+                      <tr>
+                        <th>resource</th>
+                        <th>bytes</th>
+                        <th>rev</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {cacheInfo.evicted.map((entry) => (
+                        <tr key={entry.canonical}>
+                          <td>{entry.resource}</td>
+                          <td>{entry.bytes}</td>
+                          <td>{entry.revision}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+              )}
 
               {cacheInfo.key ? (
                 cacheInfo.key.bypass ? (

@@ -7,7 +7,7 @@ import {
   parseVary,
   type CanonicalKey,
 } from './vary';
-import {VaryCache, type CachedPayload} from './cache';
+import {VaryCache, type CachedPayload, type CommitInfo} from './cache';
 
 type RecordRow = {
   id: string;
@@ -89,6 +89,22 @@ function writeKeyHeaders(
   }
 }
 
+/**
+ * Reports what a fill commit did with the response: whether it was retained,
+ * why not, and which existing variants were evicted to make room. The client
+ * only decodes and renders these — cache state stays server-owned.
+ */
+function writeStorageHeaders(res: express.Response, commit: CommitInfo) {
+  res.set('X-Cache-Stored', commit.stored ? 'true' : 'false');
+  if (!commit.stored && commit.reason) {
+    res.set('X-Cache-Not-Stored-Reason', commit.reason);
+  }
+  res.set(
+    'X-Cache-Evictions',
+    Buffer.from(JSON.stringify(commit.evicted), 'utf8').toString('base64'),
+  );
+}
+
 export function createApp() {
   const app = express();
   // Each app/workbench instance owns an isolated cache.
@@ -138,7 +154,9 @@ export function createApp() {
         return res.send(entry.body);
       }
 
-      const invalidated = found.reason === 'revision-updated';
+      // Why the lookup missed: cold cache, invalidated by a PUT, or evicted for
+      // capacity. Surfaced as the MISS reason unless a fill/join supersedes it.
+      const missCause = found.reason;
 
       // One origin fill per canonical key; concurrent equivalent requests join.
       const produce = async () => {
@@ -181,17 +199,19 @@ export function createApp() {
         if (!row) return res.status(404).json({error: 'not_found'});
         const direct = buildPayload(row, key);
         writeKeyHeaders(res, key, 'MISS', 'revision-updated');
+        writeStorageHeaders(res, {stored: false, evicted: [], reason: 'stale-revision'});
         res.status(direct.status);
         res.set(direct.headers);
         return res.send(direct.body);
       }
 
-      const reason = invalidated || revisionMoved
+      const reason = revisionMoved
         ? 'revision-updated'
         : result.reason === 'concurrent-fill-joined'
           ? 'concurrent-fill-joined'
-          : 'origin-fill';
+          : missCause;
       writeKeyHeaders(res, key, 'MISS', reason);
+      writeStorageHeaders(res, result.commit);
       res.status(payload.status);
       res.set(payload.headers);
       return res.send(payload.body);
@@ -213,9 +233,32 @@ export function createApp() {
 
     // Every stored variant under this resource is now stale.
     const resource = `/api/experiments/${row.id}`;
-    const removed = cache.invalidate(resource);
+    const {removed, freedBytes} = cache.invalidate(resource);
     res.set('X-Cache-Invalidated', String(removed));
+    res.set('X-Cache-Freed-Bytes', String(freedBytes));
     return res.json(row);
+  });
+
+  /** Server-side truth for the shared cache: budget, usage, per-variant cost. */
+  app.get('/api/cache', (_req, res) => res.json(cache.stats()));
+
+  app.put('/api/cache/budget', (req, res) => {
+    const budget = req.body?.budgetBytes;
+    const valid =
+      budget === null ||
+      (typeof budget === 'number' && Number.isInteger(budget) && budget >= 0);
+    if (!valid) {
+      return res.status(400).json({error: 'invalid_budget'});
+    }
+    // Shrinking the budget evicts existing LRU variants immediately.
+    const evicted = cache.setBudget(budget);
+    const stats = cache.stats();
+    return res.json({
+      budgetBytes: stats.budgetBytes,
+      usedBytes: stats.usedBytes,
+      evicted,
+      evictedBytes: evicted.reduce((sum, entry) => sum + entry.bytes, 0),
+    });
   });
 
   app.post('/api/experiments/:id/analyze', async (req, res) => {
