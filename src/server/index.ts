@@ -7,7 +7,7 @@ import {
   parseVary,
   type CanonicalKey,
 } from './vary';
-import {VaryCache, type CachedPayload} from './cache';
+import {VaryCache, type CachedPayload, type CommitResult} from './cache';
 
 type RecordRow = {
   id: string;
@@ -89,6 +89,31 @@ function writeKeyHeaders(
   }
 }
 
+/**
+ * Reports how a fill committed: whether the payload was retained, why not,
+ * and which entries were evicted to make room. Joined waiters receive the
+ * same commit as the fill leader, so their responses carry it too.
+ */
+function writeRetentionHeaders(
+  res: express.Response,
+  commit: CommitResult | null,
+  payloadBytes: number,
+) {
+  const stored = commit?.stored ?? false;
+  res.set('X-Cache-Retained', stored ? 'true' : 'false');
+  if (!stored) {
+    // A null commit means the revision guard refused the store outright.
+    res.set('X-Cache-Retained-Reason', commit?.reason ?? 'revision-guard');
+  }
+  res.set('X-Cache-Entry-Bytes', String(commit?.bytes ?? payloadBytes));
+  const evicted = commit?.evicted ?? [];
+  res.set('X-Cache-Evicted', String(evicted.length));
+  res.set(
+    'X-Cache-Evicted-Bytes',
+    String(evicted.reduce((sum, entry) => sum + entry.bytes, 0)),
+  );
+}
+
 export function createApp() {
   const app = express();
   // Each app/workbench instance owns an isolated cache.
@@ -133,12 +158,14 @@ export function createApp() {
       if (found.kind === 'hit') {
         const {entry} = found;
         writeKeyHeaders(res, key, 'HIT', 'stored-response');
+        res.set('X-Cache-Entry-Bytes', String(entry.bytes));
         res.status(entry.status);
         res.set(entry.headers);
         return res.send(entry.body);
       }
 
-      const invalidated = found.reason === 'revision-updated';
+      const missCause = found.reason;
+      const invalidated = missCause === 'revision-updated';
 
       // One origin fill per canonical key; concurrent equivalent requests join.
       const produce = async () => {
@@ -181,6 +208,8 @@ export function createApp() {
         if (!row) return res.status(404).json({error: 'not_found'});
         const direct = buildPayload(row, key);
         writeKeyHeaders(res, key, 'MISS', 'revision-updated');
+        res.set('X-Cache-Miss-Cause', missCause);
+        writeRetentionHeaders(res, null, direct.body.length);
         res.status(direct.status);
         res.set(direct.headers);
         return res.send(direct.body);
@@ -192,6 +221,8 @@ export function createApp() {
           ? 'concurrent-fill-joined'
           : 'origin-fill';
       writeKeyHeaders(res, key, 'MISS', reason);
+      res.set('X-Cache-Miss-Cause', missCause);
+      writeRetentionHeaders(res, result.commit, payload.body.length);
       res.status(payload.status);
       res.set(payload.headers);
       return res.send(payload.body);
@@ -213,9 +244,32 @@ export function createApp() {
 
     // Every stored variant under this resource is now stale.
     const resource = `/api/experiments/${row.id}`;
-    const removed = cache.invalidate(resource);
+    const {removed, freedBytes} = cache.invalidate(resource);
     res.set('X-Cache-Invalidated', String(removed));
+    res.set('X-Cache-Invalidated-Bytes', String(freedBytes));
     return res.json(row);
+  });
+
+  /**
+   * Authoritative cache state: budget, total stored entity bytes, and the
+   * per-variant / per-resource breakdown. Clients reconcile against this
+   * instead of estimating usage themselves.
+   */
+  app.get('/api/cache/stats', (_req, res) => res.json(cache.stats()));
+
+  /**
+   * Sets the stored-entity-byte budget of the running cache (`null` clears
+   * it). Shrinking evicts least-recently-used entries immediately; the
+   * response lists what stopped being retained plus the resulting stats.
+   */
+  app.put('/api/cache/budget', (req, res) => {
+    const raw: unknown = req.body?.budgetBytes;
+    if (raw !== null && (typeof raw !== 'number' || !Number.isInteger(raw) || raw < 0)) {
+      return res.status(400).json({error: 'invalid_budget'});
+    }
+    const {evicted} = cache.setBudget(raw);
+    res.set('X-Cache-Evicted', String(evicted.length));
+    return res.json({evicted, ...cache.stats()});
   });
 
   app.post('/api/experiments/:id/analyze', async (req, res) => {
